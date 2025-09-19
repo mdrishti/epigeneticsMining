@@ -49,7 +49,7 @@ def query_europepmc(prj_id: str) -> Dict[str, Any]:
         # fetch full-text and mine flow cell info
         xml = fetch_fulltext(entry)
         if xml:
-            hits = mine_flowcell(xml)
+            hits = mine_flowcell(xml, entry)
             print(f"{prj_id}:{entry} Flow cell terms found: {hits}")
         else:
             print(f"{prj_id}:{entry} No OA full text available")
@@ -92,12 +92,15 @@ def fetch_fulltext(pmid_or_pmcid: str) -> str:
         return resp.text
     return ""
 
-def mine_flowcell(xml_text: str) -> List[str]:
+def mine_flowcell(xml_text: str, entry: str) -> List[str]:
     # extract possible flow cell numbers or IDs from full text XML
+    #print(xml_text)
+    with open(f"{entry}.xml", "w") as f:
+        f.write(xml_text)
     tree = ET.fromstring(xml_text)
     text_chunks = [" ".join(elem.itertext()) for elem in tree.iter() if elem.text]
     text = " ".join(text_chunks)
-    pattern = re.compile(r"FLO-\\w+|R\\d\\.\\d|MIN\\d+|flow\\s*cell", re.IGNORECASE)
+    pattern = re.compile(r"FLO-\w+|R\d{1,2}\.\d{1,2}|MIN\d+|flow\s*cell", re.IGNORECASE)
     return list(set(pattern.findall(text)))
 
 
