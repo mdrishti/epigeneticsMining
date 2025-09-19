@@ -6,8 +6,13 @@ from typing import List, Dict, Any
 from pathlib import Path
 from io import StringIO
 
+import re
+from xml.etree import ElementTree as ET
+
+
 ENA_API = "https://www.ebi.ac.uk/ena/portal/api/search"
 EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+FULLTEXT_API = "https://www.ebi.ac.uk/europepmc/webservices/rest/{id}/fullTextXML"
 
 
 def query_ena(tax_id: int, platform: str) -> pd.DataFrame:
@@ -33,6 +38,22 @@ def query_europepmc(prj_id: str) -> Dict[str, Any]:
     params = {"query": query, "format": "json"}
     resp = requests.get(EUROPEPMC_API, params=params, timeout=60)
     resp.raise_for_status()
+    data = resp.json()
+    results = []
+    for record in data.get("resultList", {}).get("result", []):
+        entry = record.get("pmcid")
+        #    "pubYear": record.get("pubYear"),
+        #}
+        results.append(entry)
+        
+        # fetch full-text and mine flow cell info
+        xml = fetch_fulltext(entry)
+        if xml:
+            hits = mine_flowcell(xml)
+            print(f"{prj_id}:{entry} Flow cell terms found: {hits}")
+        else:
+            print(f"{prj_id}:{entry} No OA full text available")
+
     return resp.json()
 
 
@@ -61,6 +82,25 @@ def run_pipeline(tax_ids: List[int], platforms: List[str], output_dir: Path) -> 
     with open(output_dir / "europepmc_results.json", "w", encoding="utf-8") as f:
         json.dump(europepmc_results, f, indent=2)
     print(f"[INFO] Saved EuropePMC results → {output_dir/'europepmc_results.json'}")
+
+
+def fetch_fulltext(pmid_or_pmcid: str) -> str:
+    # fetch full text XML from EuropePMC if available
+    url = FULLTEXT_API.format(id=pmid_or_pmcid)
+    resp = requests.get(url, timeout=60)
+    if resp.status_code == 200 and resp.text.strip():
+        return resp.text
+    return ""
+
+def mine_flowcell(xml_text: str) -> List[str]:
+    # extract possible flow cell numbers or IDs from full text XML
+    tree = ET.fromstring(xml_text)
+    text_chunks = [" ".join(elem.itertext()) for elem in tree.iter() if elem.text]
+    text = " ".join(text_chunks)
+    pattern = re.compile(r"FLO-\\w+|R\\d\\.\\d|MIN\\d+|flow\\s*cell", re.IGNORECASE)
+    return list(set(pattern.findall(text)))
+
+
 
 
 if __name__ == "__main__":
