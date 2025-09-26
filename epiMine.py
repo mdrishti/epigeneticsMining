@@ -5,7 +5,6 @@ import json
 from typing import List, Dict, Any
 from pathlib import Path
 from io import StringIO
-
 import re
 from xml.etree import ElementTree as ET
 
@@ -32,13 +31,14 @@ def query_ena(tax_id: int, platform: str) -> pd.DataFrame:
     return pd.read_csv(StringIO(resp.text), sep="\t")
 
 
-def query_europepmc(prj_id: str) -> Dict[str, Any]:
+def query_europepmc(prj_id: str, tax_id: int, output_dir: Path) -> Dict[str, Any]:
     # query EuropePMC for a given PRJEB accession
     query = f"ACCESSION_TYPE:bioproject AND ACCESSION_ID:{prj_id}"
     params = {"query": query, "format": "json"}
     resp = requests.get(EUROPEPMC_API, params=params, timeout=60)
     resp.raise_for_status()
     data = resp.json()
+    has_hits = False
     results = []
     for record in data.get("resultList", {}).get("result", []):
         entry = record.get("pmcid")
@@ -49,18 +49,64 @@ def query_europepmc(prj_id: str) -> Dict[str, Any]:
         # fetch full-text and mine flow cell info
         xml = fetch_fulltext(entry)
         if xml:
-            hits = mine_flowcell(xml, entry)
+            has_hits = True
+            hits = mine_flowcell(xml, entry, tax_id, output_dir)
             print(f"{prj_id}:{entry} Flow cell terms found: {hits}")
         else:
             print(f"{prj_id}:{entry} No OA full text available")
 
-    return resp.json()
+    return data, has_hits
+
+
+def download_ena_runs_from_df(
+    ena_df: pd.DataFrame,
+    projects: List[str],
+    tax_id: int,
+    #genus_taxid: int,
+    output_dir: Path
+) -> None:
+    # Download ENA run files for projects with flowcell info,
+    # reusing the ENA dataframe already fetched in query_ena.
+    for prj in projects:
+        subset = ena_df[ena_df["study_accession"] == prj]
+        if subset.empty:
+            continue
+
+        prj_dir = output_dir / f"tax_{tax_id}" / prj
+        prj_dir.mkdir(parents=True, exist_ok=True)
+
+        for _, row in subset.iterrows():
+            run_acc = row["run_accession"]
+            print(run_acc)
+            ftp_field = row.get("fastq_ftp") or row.get("submitted_ftp")
+            if pd.isna(ftp_field):
+                continue
+            urls = str(ftp_field).split(";")
+
+            for url in urls:
+                file_name = url.split("/")[-1]
+                dest = prj_dir / file_name
+                if dest.exists():
+                    continue
+                #ftp_url = f"https://ftp.sra.ebi.ac.uk/vol1/{url}"
+                ftp_url = f"https://{url}"
+                print(f"[INFO] Downloading {ftp_url} → {dest}")
+                try:
+                    r = requests.get(ftp_url, stream=True, timeout=600)
+                    r.raise_for_status()
+                    with open(dest, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                except Exception as e:
+                    print(f"[ERROR] Failed {ftp_url}: {e}")
+
 
 
 def run_pipeline(tax_ids: List[int], platforms: List[str], output_dir: Path) -> None:
     # run ENA + EuropePMC pipeline for multiple tax IDs and platforms
     output_dir.mkdir(parents=True, exist_ok=True)
     europepmc_results = {}
+    flowcell_positive_projects = []
 
     for tax_id in tax_ids:
         for platform in platforms:
@@ -73,11 +119,25 @@ def run_pipeline(tax_ids: List[int], platforms: List[str], output_dir: Path) -> 
             ena_out = output_dir / f"ena_results_tax{tax_id}_{platform}.tsv"
             ena_df.to_csv(ena_out, sep="\t", index=False)
             print(f"[INFO] Saved ENA results → {ena_out}")
+            cols = [c for c in ["study_accession", "tax_id", "tax_lineage"] if c in ena_df.columns]
+            prj_ids = ena_df.loc[:, cols].dropna().drop_duplicates()
+            #prj_ids = ena_df[["study_accession", "tax_id", "tax_lineage"]].dropna().drop_duplicates()
+            #prj_ids = ena_df["study_accession"].dropna().unique()
+            #for prj_id in prj_ids:
+            for _, row in prj_ids.iterrows():
+                prj_id = row["study_accession"]
+                sample_tax_id = int(row["tax_id"])
+                lineage = row["tax_lineage"]
 
-            prj_ids = ena_df["study_accession"].dropna().unique()
-            for prj_id in prj_ids:
+                # derive genus taxid
+                #genus_taxid = extract_genus_taxid(lineage, sample_tax_id)
+
                 if prj_id not in europepmc_results:
-                    europepmc_results[prj_id] = query_europepmc(prj_id)
+                    europepmc_results[prj_id], has_hits = query_europepmc(prj_id, tax_id, output_dir)
+                    if has_hits:
+                        flowcell_positive_projects.append((prj_id, tax_id))
+            for prj_id, tax_id in flowcell_positive_projects:
+                download_ena_runs_from_df(ena_df, [prj_id], tax_id, output_dir)
 
     with open(output_dir / "europepmc_results.json", "w", encoding="utf-8") as f:
         json.dump(europepmc_results, f, indent=2)
@@ -92,16 +152,29 @@ def fetch_fulltext(pmid_or_pmcid: str) -> str:
         return resp.text
     return ""
 
-def mine_flowcell(xml_text: str, entry: str) -> List[str]:
+def mine_flowcell(xml_text: str, entry: str, tax_id: int, output_dir: Path) -> List[str]:
     # extract possible flow cell numbers or IDs from full text XML
     #print(xml_text)
-    with open(f"{entry}.xml", "w") as f:
+    tax_dir = output_dir / f"tax_{tax_id}"
+    tax_dir.mkdir(parents=True, exist_ok=True)
+    xml_path = tax_dir / f"{entry}.xml"
+    #with open(f"{entry}.xml", "w") as f:
+    with open(xml_path, "w", encoding="utf-8") as f:
         f.write(xml_text)
+
     tree = ET.fromstring(xml_text)
     text_chunks = [" ".join(elem.itertext()) for elem in tree.iter() if elem.text]
     text = " ".join(text_chunks)
-    pattern = re.compile(r"FLO-\w+|R\d{1,2}\.\d{1,2}|MIN\d+|flow\s*cell", re.IGNORECASE)
-    return list(set(pattern.findall(text)))
+    pattern = re.compile(r"FLO-\w+|R\d{1,2}\.\d{1,2}|MIN\d+|flow\s*cell", re.IGNORECASE) # regex for flowcells
+    hits = list(set(pattern.findall(text)))
+    tsv_path = tax_dir / "flowcell_hits.tsv"
+    header = not tsv_path.exists()
+    with open(tsv_path, "a", encoding="utf-8") as tsv_file:
+        if header:
+            tsv_file.write("pmc_id\tgenus_taxid\thits\n")
+        tsv_file.write(f"{entry}\t{tax_id}\t{','.join(hits) if hits else 'NA'}\n")
+    return hits
+
 
 
 
